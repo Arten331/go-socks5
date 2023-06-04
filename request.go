@@ -1,13 +1,12 @@
 package socks5
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
-
-	"golang.org/x/net/context"
 )
 
 const (
@@ -79,6 +78,7 @@ type Request struct {
 	// AddrSpec of the actual destination (might be affected by rewrite)
 	realDestAddr *AddrSpec
 	bufConn      io.Reader
+	conn         net.Conn
 }
 
 type conn interface {
@@ -87,7 +87,7 @@ type conn interface {
 }
 
 // NewRequest creates a new Request from the tcp connection
-func NewRequest(bufConn io.Reader) (*Request, error) {
+func NewRequest(bufConn io.Reader, c net.Conn) (*Request, error) {
 	// Read the version byte
 	header := []byte{0, 0, 0}
 	if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
@@ -110,6 +110,7 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 		Command:  header[1],
 		DestAddr: dest,
 		bufConn:  bufConn,
+		conn:     c,
 	}
 
 	return request, nil
@@ -188,7 +189,10 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 		}
 		return fmt.Errorf("Connect to %v failed: %v", req.DestAddr, err)
 	}
-	defer target.Close()
+	defer func() {
+		_ = req.conn.Close()
+		_ = target.Close()
+	}()
 
 	// Send success
 	local := target.LocalAddr().(*net.TCPAddr)
@@ -199,8 +203,12 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 
 	// Start proxying
 	errCh := make(chan error, 2)
-	go proxy(target, req.bufConn, errCh)
-	go proxy(conn, target, errCh)
+	go func() {
+		copyOrWarn(req.conn, target, errCh)
+	}()
+	go func() {
+		copyOrWarn(target, req.conn, errCh)
+	}()
 
 	// Wait
 	for i := 0; i < 2; i++ {
@@ -210,6 +218,7 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 			return e
 		}
 	}
+
 	return nil
 }
 
@@ -349,16 +358,12 @@ func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
 	return err
 }
 
-type closeWriter interface {
-	CloseWrite() error
-}
+func copyOrWarn(dst io.Writer, src io.Reader, errCh chan error) {
+	buf := AcquireBuffer()
 
-// proxy is used to suffle data from src to destination, and sends errors
-// down a dedicated channel
-func proxy(dst io.Writer, src io.Reader, errCh chan error) {
-	_, err := io.Copy(dst, src)
-	if tcpConn, ok := dst.(closeWriter); ok {
-		tcpConn.CloseWrite()
-	}
+	_, err := io.CopyBuffer(dst, src, buf)
+
+	ReleaseBuffer(buf)
+
 	errCh <- err
 }
